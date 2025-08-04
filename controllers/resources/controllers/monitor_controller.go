@@ -19,8 +19,12 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"github.com/go-redis/redis/v8"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"math"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,8 +40,6 @@ import (
 	kbv1alpha1 "github.com/apecloud/kubeblocks/apis/dataprotection/v1alpha1"
 
 	"golang.org/x/sync/errgroup"
-
-	"github.com/labring/sealos/controllers/pkg/utils/env"
 
 	"golang.org/x/sync/semaphore"
 
@@ -73,25 +75,41 @@ import (
 type MonitorReconciler struct {
 	client.Client
 	logr.Logger
-	Interval                 time.Duration
-	Scheme                   *runtime.Scheme
-	stopCh                   chan struct{}
-	wg                       sync.WaitGroup
-	periodicReconcile        time.Duration
-	NvidiaGpu                map[string]gpu.NvidiaGPU
-	gpuMutex                 sync.Mutex
-	DBClient                 database.Interface
-	TrafficClient            database.Interface
-	Properties               *resources.PropertyTypeLS
-	PromURL                  string
+	Interval          time.Duration
+	Scheme            *runtime.Scheme
+	stopCh            chan struct{}
+	wg                sync.WaitGroup
+	periodicReconcile time.Duration
+
+	// GPU 缓存相关
+	NvidiaGpu map[string]gpu.NvidiaGPU
+	gpuMutex  sync.Mutex
+
+	// 依赖客户端
+	DBClient                database.Interface
+	TrafficClient           database.Interface
+	ObjStorageClient        *minio.Client
+	ObjStorageMetricsClient *objstorage.MetricsClient
+
+	// 属性、配置
+	Properties            *resources.PropertyTypeLS
+	PromURL               string
+	ObjectStorageInstance string
+
 	lastObjectMetrics        objstorage.Metrics
 	currentObjectMetrics     objstorage.Metrics
-	ObjStorageClient         *minio.Client
-	ObjStorageMetricsClient  *objstorage.MetricsClient
 	ObjStorageUserBackupSize map[string]int64
-	ObjectStorageInstance    string
+
+	RedisClient    *redis.Client
+	TrafficCache   *TrafficCache
+	mu             sync.Mutex
+	podResUsageMap map[string]map[string]map[corev1.ResourceName]*quantity
 }
 
+type TrafficCache struct {
+	Redis *redis.Client
+	TTL   time.Duration
+}
 type quantity struct {
 	*resource.Quantity
 	detail string
@@ -107,6 +125,19 @@ var concurrentLimit = int64(DefaultConcurrencyLimit)
 
 const (
 	DefaultConcurrencyLimit = 1000
+)
+
+type NodeReconciler struct {
+	client.Client
+	logr.Logger
+	parent *MonitorReconciler // 用于刷新 GPU 缓存
+}
+
+const (
+	trafficCollectDelay = 10 * time.Second // 延迟时间
+	trafficWindowLead   = 10 * time.Second // 滑窗前移时间
+	trafficWindowLag    = 70 * time.Second // 滑窗后移时间
+	flushInterval       = 3 * time.Minute  // 批量写入间隔
 )
 
 //+kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch
@@ -131,21 +162,75 @@ func NewMonitorReconciler(mgr ctrl.Manager) (*MonitorReconciler, error) {
 		PromURL:               os.Getenv(PrometheusURL),
 		ObjectStorageInstance: os.Getenv(ObjectStorageInstance),
 		NvidiaGpu:             make(map[string]gpu.NvidiaGPU),
+		podResUsageMap:        make(map[string]map[string]map[corev1.ResourceName]*quantity),
 	}
-	concurrentLimit = env.GetInt64EnvWithDefault(ConcurrentLimit, DefaultConcurrencyLimit)
-	var err error
-	err = retry.Retry(2, 1*time.Second, func() error {
-		r.NvidiaGpu, err = gpu.GetNodeGpuModel(mgr.GetClient())
-		if err != nil {
-			return fmt.Errorf("failed to get node gpu model: %v", err)
-		}
-		return nil
+
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "redis:6379" // fallback
+	}
+	r.RedisClient = redis.NewClient(&redis.Options{
+		Addr:     redisAddr,
+		Password: "",
+		DB:       0,
 	})
-	if err != nil {
+	r.TrafficCache = &TrafficCache{Redis: r.RedisClient, TTL: 2 * time.Hour}
+
+	// ② 初始化 GPU 缓存
+	if err := retry.Retry(2, time.Second, func() error {
+		var err error
+		r.NvidiaGpu, err = gpu.GetNodeGpuModel(mgr.GetClient())
+		return err
+	}); err != nil {
 		return nil, err
 	}
-	r.Logger.Info("get gpu model", "gpu model", r.NvidiaGpu)
+
+	r.Logger.Info("initial GPU cache", "models", r.NvidiaGpu)
 	return r, nil
+}
+
+func NewNodeReconciler(mgr ctrl.Manager, parent *MonitorReconciler) (*NodeReconciler, error) {
+	return &NodeReconciler{
+		Client: mgr.GetClient(),
+		Logger: ctrl.Log.WithName("controllers").WithName("Node"),
+		parent: parent,
+	}, nil
+}
+
+func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	node := &corev1.Node{}
+	if err := r.Get(ctx, req.NamespacedName, node); err != nil {
+		if errors.IsNotFound(err) {
+			// 节点删除，清理 GPU 缓存
+			r.parent.gpuMutex.Lock()
+			delete(r.parent.NvidiaGpu, req.Name)
+			r.parent.gpuMutex.Unlock()
+			return ctrl.Result{}, nil
+		}
+		return ctrl.Result{}, err
+	}
+
+	// 刷新 GPU 型号缓存（一次性拿全集更省 API 调用）
+	models, err := gpu.GetNodeGpuModel(r.Client)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	r.parent.gpuMutex.Lock()
+	r.parent.NvidiaGpu = models
+	r.parent.gpuMutex.Unlock()
+	r.Logger.Info("refreshed GPU cache", "size", len(models))
+	return ctrl.Result{}, nil
+}
+
+func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Node{}).
+		WithEventFilter(predicate.Or(
+			predicate.LabelChangedPredicate{},
+			predicate.AnnotationChangedPredicate{},
+			predicate.GenerationChangedPredicate{},
+		)).
+		Complete(r)
 }
 
 func InitIndexField(mgr ctrl.Manager) error {
@@ -168,81 +253,127 @@ func InitIndexField(mgr ctrl.Manager) error {
 }
 
 func (r *MonitorReconciler) StartReconciler(ctx context.Context) error {
-	r.startPeriodicReconcile()
+	r.startPeriodicReconcile(ctx)
 	if r.TrafficClient != nil || r.ObjStorageClient != nil {
-		r.startMonitorTraffic()
+		r.startMonitorTraffic(ctx)
+		r.startAsyncTrafficFlusher()
 	}
 	<-ctx.Done()
 	r.stopPeriodicReconcile()
 	return nil
 }
 
-func (r *MonitorReconciler) startPeriodicReconcile() {
+func (r *MonitorReconciler) startPeriodicReconcile(ctx context.Context) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		waitNextMinute()
+		waitNextMinuteWithDelay(ctx, trafficCollectDelay)
 		ticker := time.NewTicker(r.periodicReconcile)
+		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				r.enqueueNamespacesForReconcile()
+				// 传入上下文，方便在 processNamespaceList 里面用来取消等待信号
+				r.enqueueNamespacesForReconcile(ctx)
 			case <-r.stopCh:
-				ticker.Stop()
+				return
+			case <-ctx.Done():
+				// context 取消时退出
 				return
 			}
 		}
 	}()
 }
 
-func (r *MonitorReconciler) getNamespaceList() (*corev1.NamespaceList, error) {
+func (r *MonitorReconciler) getNamespaceList(ctx context.Context) (*corev1.NamespaceList, error) {
 	namespaceList := &corev1.NamespaceList{}
 	req, err := labels.NewRequirement(userv1.UserLabelOwnerKey, selection.Exists, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create label requirement: %v", err)
 	}
-	return namespaceList, r.List(context.Background(), namespaceList, &client.ListOptions{
+	return namespaceList, r.List(ctx, namespaceList, &client.ListOptions{
 		LabelSelector: labels.NewSelector().Add(*req),
 	})
 }
 
-func waitNextMinute() {
-	waitTime := time.Until(time.Now().Truncate(time.Minute).Add(1 * time.Minute))
-	if waitTime > 0 {
-		logger.Info("wait for first reconcile", "waitTime", waitTime)
-		time.Sleep(waitTime)
+func waitNextMinuteWithDelay(ctx context.Context, delay time.Duration) {
+	waitTime := time.Until(time.Now().Truncate(time.Minute).Add(1*time.Minute)).Truncate(time.Second) + delay
+	if waitTime <= 0 {
+		return
+	}
+	logger.Info("wait for first reconcile", "waitTime", waitTime)
+	select {
+	case <-time.After(waitTime):
+	case <-ctx.Done():
 	}
 }
 
-func waitNextHour() {
-	waitTime := time.Until(time.Now().Truncate(time.Hour).Add(1 * time.Hour))
-	if waitTime > 0 {
-		logger.Info("wait for first reconcile", "waitTime", waitTime)
-		time.Sleep(waitTime)
+func waitNextHour(ctx context.Context) {
+	d := time.Until(time.Now().Truncate(time.Hour).Add(time.Hour))
+	if d <= 0 {
+		return
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
 	}
 }
 
-func (r *MonitorReconciler) startMonitorTraffic() {
+func (r *MonitorReconciler) Close() {
+	if r.RedisClient != nil {
+		err := r.RedisClient.Close()
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (r *MonitorReconciler) startMonitorTraffic(ctx context.Context) {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		startTime, endTime := time.Now().UTC(), time.Now().Truncate(time.Hour).Add(1*time.Hour).UTC()
-		waitNextHour()
+
+		// 初始化窗口
+		endTime := time.Now().UTC().Truncate(time.Minute).Add(-trafficWindowLead)
+		startTime := endTime.Add(-trafficWindowLag)
+
+		// 等待下个小时整点再执行首次监控
+		waitNextMinuteWithDelay(ctx, trafficCollectDelay)
+		waitNextHour(ctx)
+
 		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+
+		// 首次执行
 		if err := r.MonitorTrafficUsed(startTime, endTime); err != nil {
-			r.Logger.Error(err, "failed to monitor pod traffic used")
+			r.Logger.Error(err, "failed to monitor traffic on initial run", "startTime", startTime, "endTime", endTime)
 		}
+
 		for {
 			select {
-			case <-ticker.C:
-				startTime, endTime = endTime, endTime.Add(1*time.Hour)
-				if err := r.MonitorTrafficUsed(startTime, endTime); err != nil {
-					r.Logger.Error(err, "failed to monitor pod traffic used")
-					break
-				}
 			case <-r.stopCh:
-				ticker.Stop()
 				return
+			case <-ticker.C:
+				// 使用超时保护，避免长时间阻塞
+				done := make(chan struct{})
+				go func(prevEnd time.Time) {
+					defer close(done)
+					newStart, newEnd := prevEnd, prevEnd.Add(1*time.Hour)
+					if err := r.MonitorTrafficUsed(newStart, newEnd); err != nil {
+						r.Logger.Error(err, "failed to monitor pod traffic used", "start", newStart, "end", newEnd)
+					}
+				}(endTime)
+
+				select {
+				case <-done:
+					// 正常完成
+					endTime = endTime.Add(1 * time.Hour)
+					startTime = endTime.Add(-trafficWindowLag)
+				case <-time.After(60 * time.Second):
+					r.Logger.Error(fmt.Errorf("timeout"), "MonitorTrafficUsed timed out", "start", startTime, "end", endTime)
+				}
 			}
 		}
 	}()
@@ -253,18 +384,17 @@ func (r *MonitorReconciler) stopPeriodicReconcile() {
 	r.wg.Wait()
 }
 
-func (r *MonitorReconciler) enqueueNamespacesForReconcile() {
+func (r *MonitorReconciler) enqueueNamespacesForReconcile(ctx context.Context) {
 	r.Logger.Info("enqueue namespaces for reconcile", "time", time.Now().Format(time.RFC3339))
 
-	namespaceList, err := r.getNamespaceList()
+	namespaceList, err := r.getNamespaceList(ctx)
 	if err != nil {
 		r.Logger.Error(err, "failed to list namespaces")
 		return
 	}
 
 	filterNormalNamespace(namespaceList)
-
-	if err := r.processNamespaceList(namespaceList); err != nil {
+	if err := r.processNamespaceList(ctx, namespaceList); err != nil {
 		r.Logger.Error(err, "failed to process namespace", "time", time.Now().Format(time.RFC3339))
 	}
 }
@@ -287,8 +417,8 @@ func filterNormalNamespace(namespaceList *corev1.NamespaceList) {
 	logger.Info("filter normal namespace", "namespaceList len", len(namespaceList.Items), "time", time.Now().Format(time.RFC3339))
 }
 
-func (r *MonitorReconciler) processNamespaceList(namespaceList *corev1.NamespaceList) error {
-	logger.Info("start processNamespaceList", "namespaceList len", len(namespaceList.Items), "time", time.Now().Format(time.RFC3339))
+func (r *MonitorReconciler) processNamespaceList(ctx context.Context, namespaceList *corev1.NamespaceList) error {
+	r.Logger.Info("start processNamespaceList", "namespaceList len", len(namespaceList.Items), "time", time.Now().Format(time.RFC3339))
 	if len(namespaceList.Items) == 0 {
 		r.Logger.Error(fmt.Errorf("no namespace to process"), "")
 		return nil
@@ -302,8 +432,8 @@ func (r *MonitorReconciler) processNamespaceList(namespaceList *corev1.Namespace
 	for i := range namespaceList.Items {
 		go func(namespace *corev1.Namespace) {
 			defer wg.Done()
-			if err := sem.Acquire(context.Background(), 1); err != nil {
-				fmt.Printf("Failed to acquire semaphore: %v\n", err)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				r.Logger.Error(err, "Failed to acquire semaphore")
 				return
 			}
 			defer sem.Release(1)
@@ -316,7 +446,7 @@ func (r *MonitorReconciler) processNamespaceList(namespaceList *corev1.Namespace
 	if err := r.monitorObjectStorageTraffic(); err != nil {
 		r.Logger.Error(err, "failed to monitor object storage traffic")
 	}
-	logger.Info("end processNamespaceList", "time", time.Now().Format("2006-01-02 15:04:05"))
+	r.Logger.Info("end processNamespaceList", "time", time.Now().Format("2006-01-02 15:04:05"))
 	return nil
 }
 
@@ -367,9 +497,25 @@ func (r *MonitorReconciler) monitorResourceUsage(namespace *corev1.Namespace) er
 	timeStamp := time.Now().UTC()
 	resUsed := map[string]map[corev1.ResourceName]*quantity{}
 	resNamed := make(map[string]*resources.ResourceNamed)
+
 	instances, err := r.getInstances(namespace.Name)
 	if err != nil {
 		return fmt.Errorf("failed to get instances: %v", err)
+	}
+
+	podResMap := r.collectNamespacePodUsage(namespace.Name)
+
+	for podName, podRes := range podResMap {
+		resNameStr := fmt.Sprintf("pod/%s/%s", namespace.Name, podName)
+		if resUsed[resNameStr] == nil {
+			resUsed[resNameStr] = initResources()
+		}
+		for resName, qty := range podRes {
+			resUsed[resNameStr][resName].Add(*qty.Quantity)
+		}
+		if _, exists := resNamed[resNameStr]; !exists {
+			resNamed[resNameStr] = &resources.ResourceNamed{}
+		}
 	}
 	if err := r.monitorPodResourceUsage(namespace.Name, resUsed, resNamed, instances); err != nil {
 		return fmt.Errorf("failed to monitor pod resource usage: %v", err)
@@ -438,11 +584,19 @@ func (r *MonitorReconciler) monitorPodResourceUsage(namespace string, resUsed ma
 
 	for i := range podList.Items {
 		pod := &podList.Items[i]
-		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded && time.Since(pod.Status.StartTime.Time) > 1*time.Minute {
+		if pod.Spec.NodeName == "" || (pod.Status.Phase == corev1.PodSucceeded && time.Since(pod.Status.StartTime.Time) > 1*time.Minute) {
 			continue
 		}
 		podResNamed := resources.NewResourceNamed(pod)
 		podResNamed.SetInstanceParent(instances)
+		// 若该 Pod 已从缓存计入，避免重复统计
+		if _, exists := resUsed[podResNamed.String()]; exists {
+			// 仍然维护命名信息，防止后续getResourceUsed 取类型失败
+			if _, ok := resNamed[podResNamed.String()]; !ok {
+				resNamed[podResNamed.String()] = podResNamed
+			}
+			continue
+		}
 		resNamed[podResNamed.String()] = podResNamed
 		if resUsed[podResNamed.String()] == nil {
 			resUsed[podResNamed.String()] = initResources()
@@ -472,6 +626,33 @@ func (r *MonitorReconciler) monitorPodResourceUsage(namespace string, resUsed ma
 		}
 	}
 	return nil
+}
+
+func (r *MonitorReconciler) collectNamespacePodUsage(namespace string) map[string]map[corev1.ResourceName]*quantity {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	nsUsageCopy := make(map[string]map[corev1.ResourceName]*quantity)
+	if podMap, ok := r.podResUsageMap[namespace]; ok {
+		for podName, resMap := range podMap {
+			copied := initResources()
+			for resName, qty := range resMap {
+				copied[resName] = qty.DeepCopy() // Quantity 有 DeepCopy 方法，quantity需要你写一个
+			}
+			nsUsageCopy[podName] = copied
+		}
+	}
+	return nsUsageCopy
+}
+
+func (q *quantity) DeepCopy() *quantity {
+	if q == nil {
+		return nil
+	}
+	clone := q.Quantity.DeepCopy() // clone 是值，不是指针
+	return &quantity{
+		Quantity: &clone, // 取地址，满足 *resource.Quantity
+		detail:   q.detail,
+	}
 }
 
 func (r *MonitorReconciler) monitorPVCResourceUsage(namespace string, resUsed map[string]map[corev1.ResourceName]*quantity, resNamed map[string]*resources.ResourceNamed, instances map[string]struct{}) error {
@@ -517,7 +698,14 @@ func (r *MonitorReconciler) monitorDatabaseBackupUsage(namespace string, resUsed
 			resNamed[backupRes.String()] = backupRes
 			resUsed[backupRes.String()] = initResources()
 		}
-		resUsed[backupRes.String()][corev1.ResourceStorage].Add(resource.MustParse(backup.Status.TotalSize))
+		size := strings.TrimSpace(backup.Status.TotalSize)
+		if size != "" {
+			if q, err := resources.ParseCustomQuantity(size); err == nil {
+				resUsed[backupRes.String()][corev1.ResourceStorage].Add(q)
+			} else {
+				r.Logger.Error(err, "parse custom quantity failed", "backup", backup)
+			}
+		}
 	}
 	return nil
 }
@@ -547,7 +735,8 @@ func (r *MonitorReconciler) monitorServiceResourceUsage(namespace string, resUse
 			resUsed[svcRes.String()] = initResources()
 		}
 		// nodeport 1:1000, the measurement is quantity 1000
-		resUsed[svcRes.String()][corev1.ResourceServicesNodePorts].Add(*resource.NewQuantity(int64(1000*len(port)), resource.BinarySI))
+		resUsed[svcRes.String()][corev1.ResourceServicesNodePorts].Add(
+			*resource.NewQuantity(int64(1000*len(port)), resource.DecimalSI))
 	}
 	return nil
 }
@@ -571,7 +760,11 @@ func (r *MonitorReconciler) getResourceUsed(podResource map[corev1.ResourceName]
 
 func (r *MonitorReconciler) monitorObjectStorageUsage(namespace string, resMap map[string]map[corev1.ResourceName]*quantity, namedMap map[string]*resources.ResourceNamed) error {
 	username := config.GetUserNameByNamespace(namespace)
-	if r.currentObjectMetrics == nil || r.currentObjectMetrics[username].Usage == nil {
+	if r.currentObjectMetrics == nil {
+		return nil
+	}
+	metric, ok := r.currentObjectMetrics[username]
+	if !ok || metric.Usage == nil {
 		return nil
 	}
 	for bucket, usage := range r.currentObjectMetrics[username].Usage {
@@ -594,31 +787,31 @@ func (r *MonitorReconciler) monitorObjectStorageTraffic() error {
 	}
 	var objTraffic []*types.ObjectStorageTraffic
 	now := time.Now().UTC()
+
+	// 滑动窗口：保证数据覆盖
+	endTime := time.Now().UTC().Truncate(time.Minute).Add(-trafficWindowLead)
+	startTime := endTime.Add(-trafficWindowLag)
+
+	logger.Info("monitor object storage traffic",
+		"startTime", startTime.Format(time.RFC3339),
+		"endTime", endTime.Format(time.RFC3339))
+
 	for user, metric := range r.currentObjectMetrics {
 		if len(metric.Sent) == 0 {
 			continue
 		}
 		for bucket, m := range metric.Sent {
-			sent := int64(0)
-			if r.lastObjectMetrics != nil && r.lastObjectMetrics[user].Sent != nil {
-				if _, ok := r.lastObjectMetrics[user].Sent[bucket]; ok {
-					if m == -1 {
-						r.currentObjectMetrics[user].Sent[bucket] = r.lastObjectMetrics[user].Sent[bucket]
-						m = r.lastObjectMetrics[user].Sent[bucket]
-					} else {
-						ss := m - r.lastObjectMetrics[user].Sent[bucket]
-						if ss > 0 {
-							sent = ss
-						}
-					}
-				}
-			}
+			// 使用 Redis 缓存计算 delta
+			delta := r.TrafficCache.Delta(context.Background(), user, bucket, m)
+
+			// 更新缓存
+			_ = r.TrafficCache.SaveTraffic(context.Background(), user, bucket, m)
 			objTraffic = append(objTraffic, &types.ObjectStorageTraffic{
 				Time:      now,
 				User:      user,
 				Bucket:    bucket,
 				TotalSent: m,
-				Sent:      sent,
+				Sent:      delta,
 			})
 		}
 	}
@@ -627,7 +820,216 @@ func (r *MonitorReconciler) monitorObjectStorageTraffic() error {
 			return fmt.Errorf("failed to save object storage traffic: %w", err)
 		}
 	}
+
 	return nil
+}
+
+func (r *MonitorReconciler) startAsyncTrafficFlusher() {
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				r.flushStableObjectTrafficToDB() // 异步补偿写入数据库
+			case <-r.stopCh:
+				return
+			}
+		}
+	}()
+}
+
+func (r *MonitorReconciler) flushStableObjectTrafficToDB() {
+	ctx := context.Background()
+	keys := r.scanKeys(ctx, "traffic:object:*")
+
+	var traffics []*types.ObjectStorageTraffic
+	now := time.Now().UTC()
+
+	for _, key := range keys {
+		vals, err := r.RedisClient.HGetAll(ctx, key).Result()
+		if err != nil {
+			r.Logger.Error(err, "Redis HGetAll failed", "key", key)
+			continue
+		}
+		if len(vals) == 0 {
+			continue
+		}
+
+		ts, err := time.Parse(time.RFC3339, vals["timestamp"])
+		if err != nil {
+			r.Logger.Error(err, "invalid timestamp format in Redis", "key", key, "value", vals["timestamp"])
+			continue
+		}
+		if now.Sub(ts) < 90*time.Second {
+			// 数据不稳定，跳过
+			continue
+		}
+
+		current, err1 := strconv.ParseInt(vals["current"], 10, 64)
+		previous, err2 := strconv.ParseInt(vals["previous"], 10, 64)
+		if err1 != nil || err2 != nil {
+			r.Logger.Error(fmt.Errorf("parse int error"), "current/previous parse failed", "key", key, "current", vals["current"], "previous", vals["previous"])
+			continue
+		}
+
+		sent := int64(math.Max(0, float64(current-previous)))
+
+		parts := strings.Split(key, ":")
+		if len(parts) < 4 {
+			r.Logger.Info("unexpected Redis key format", "key", key)
+			continue
+		}
+		user, bucket := parts[2], parts[3]
+
+		traffics = append(traffics, &types.ObjectStorageTraffic{
+			Time:      ts,
+			User:      user,
+			Bucket:    bucket,
+			TotalSent: current,
+			Sent:      sent,
+		})
+	}
+
+	if len(traffics) > 0 {
+		if err := r.DBClient.SaveObjTraffic(traffics...); err != nil {
+			r.Logger.Error(err, "flushStableObjectTrafficToDB: SaveObjTraffic failed", "count", len(traffics))
+		} else {
+			r.Logger.Info("flushStableObjectTrafficToDB: flushed traffic", "count", len(traffics))
+		}
+	}
+}
+
+func (r *MonitorReconciler) scanKeys(ctx context.Context, pattern string) []string {
+	var cursor uint64
+	var keys []string
+	for {
+		batch, next, err := r.RedisClient.Scan(ctx, cursor, pattern, 100).Result()
+		if err != nil {
+			r.Logger.Error(err, "error scanning redis keys", "pattern", pattern, "cursor", cursor)
+			break
+		}
+		keys = append(keys, batch...)
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return keys
+}
+
+func (tc *TrafficCache) SaveTraffic(ctx context.Context, user, bucket string, current int64) error {
+	key := fmt.Sprintf("traffic:object:%s:%s", user, bucket)
+	prevVal := current
+	if val, err := tc.Redis.HGet(ctx, key, "current").Result(); err == nil {
+		if pv, errParse := strconv.ParseInt(val, 10, 64); errParse == nil {
+			prevVal = pv
+		}
+	}
+	pipe := tc.Redis.TxPipeline()
+	pipe.HSet(ctx, key, map[string]interface{}{
+		"previous":  prevVal,
+		"current":   current,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+	pipe.Expire(ctx, key, tc.TTL)
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		logger.Error(err, "[Redis] SaveTraffic failed", "key", key)
+	}
+	return err
+}
+
+func (r *MonitorReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).For(&corev1.Pod{}).Complete(r)
+}
+
+func (r *MonitorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	pod := &corev1.Pod{}
+	err := r.Get(ctx, req.NamespacedName, pod)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			// 删除 Pod 时同步回收命名空间级缓存
+			r.mu.Lock()
+			if nsPods, exists := r.podResUsageMap[req.Namespace]; exists {
+				delete(nsPods, req.Name)
+				if len(nsPods) == 0 {
+					delete(r.podResUsageMap, req.Namespace)
+				}
+			}
+			r.mu.Unlock()
+		}
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	podResUsage := r.calculatePodResource(pod)
+
+	r.mu.Lock()
+	nsMap, ok := r.podResUsageMap[pod.Namespace]
+	if !ok {
+		nsMap = make(map[string]map[corev1.ResourceName]*quantity)
+		r.podResUsageMap[pod.Namespace] = nsMap
+	}
+	nsMap[pod.Name] = podResUsage
+	r.mu.Unlock()
+
+	return ctrl.Result{}, nil
+}
+
+func (r *MonitorReconciler) calculatePodResource(pod *corev1.Pod) map[corev1.ResourceName]*quantity {
+	usage := initResources()
+
+	if pod.Spec.NodeName == "" ||
+		(pod.Status.Phase == corev1.PodSucceeded && time.Since(pod.Status.StartTime.Time) > 1*time.Minute) {
+		return usage
+	}
+
+	skip := pod.Status.Phase != corev1.PodRunning && (pod.Status.StartTime == nil || time.Since(pod.Status.StartTime.Time) > 1*time.Minute)
+
+	for _, c := range pod.Spec.Containers {
+		if gpuReq, ok := c.Resources.Limits[gpu.NvidiaGpuKey]; ok {
+			// gpu only use limit
+			usage[gpu.NvidiaGpuKey].Add(gpuReq)
+		}
+		if skip {
+			continue
+		}
+		if cpuLimit, ok := c.Resources.Limits[corev1.ResourceCPU]; ok {
+			usage[corev1.ResourceCPU].Add(cpuLimit)
+		} else if cpuReq, ok := c.Resources.Requests[corev1.ResourceCPU]; ok {
+			usage[corev1.ResourceCPU].Add(cpuReq)
+		}
+		if memLimit, ok := c.Resources.Limits[corev1.ResourceMemory]; ok {
+			usage[corev1.ResourceMemory].Add(memLimit)
+		} else if memReq, ok := c.Resources.Requests[corev1.ResourceMemory]; ok {
+			usage[corev1.ResourceMemory].Add(memReq)
+		}
+	}
+
+	return usage
+}
+
+func (tc *TrafficCache) Delta(ctx context.Context, user, bucket string, current int64) int64 {
+	key := fmt.Sprintf("traffic:object:%s:%s", user, bucket)
+	val, err := tc.Redis.HGet(ctx, key, "current").Result()
+	if err != nil {
+		logger.Info("[Redis] Delta cold start -> 0", "key", key, "err", err)
+		return 0
+	}
+	prev, errParse := strconv.ParseInt(val, 10, 64)
+	if errParse != nil {
+		logger.Info("[Redis] Delta parse failed -> 0", "key", key, "err", errParse)
+		return 0
+	}
+	if prev == 0 {
+		return 0
+	}
+	if current < prev {
+		return 0
+	}
+	return current - prev
 }
 
 func (r *MonitorReconciler) MonitorTrafficUsed(startTime, endTime time.Time) error {
@@ -760,13 +1162,12 @@ func (r *MonitorReconciler) getGPUResourceUsage(pod *corev1.Pod, gpuReq resource
 
 func initResources() (rs map[corev1.ResourceName]*quantity) {
 	rs = make(map[corev1.ResourceName]*quantity)
-	rs[resources.ResourceGPU] = initGpuResources()
-	rs[corev1.ResourceCPU] = &quantity{Quantity: resource.NewQuantity(0, resource.DecimalSI), detail: ""}
-	rs[corev1.ResourceMemory] = &quantity{Quantity: resource.NewQuantity(0, resource.BinarySI), detail: ""}
-	rs[corev1.ResourceStorage] = &quantity{Quantity: resource.NewQuantity(0, resource.BinarySI), detail: ""}
-	rs[resources.ResourceNetwork] = &quantity{Quantity: resource.NewQuantity(0, resource.BinarySI), detail: ""}
-	rs[corev1.ResourceServicesNodePorts] = &quantity{Quantity: resource.NewQuantity(0, resource.DecimalSI), detail: ""}
-	return
+	rs[corev1.ResourceCPU] = &quantity{Quantity: resource.NewQuantity(0, resource.DecimalSI)}
+	rs[corev1.ResourceMemory] = &quantity{Quantity: resource.NewQuantity(0, resource.BinarySI)}
+	rs[corev1.ResourceStorage] = &quantity{Quantity: resource.NewQuantity(0, resource.BinarySI)}
+	rs[resources.ResourceNetwork] = &quantity{Quantity: resource.NewQuantity(0, resource.DecimalSI)}
+	rs[corev1.ResourceServicesNodePorts] = &quantity{Quantity: resource.NewQuantity(0, resource.DecimalSI)}
+	return rs
 }
 
 func initGpuResources() *quantity {
