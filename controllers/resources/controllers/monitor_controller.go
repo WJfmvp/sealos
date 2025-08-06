@@ -165,18 +165,17 @@ func NewMonitorReconciler(mgr ctrl.Manager) (*MonitorReconciler, error) {
 		podResUsageMap:        make(map[string]map[string]map[corev1.ResourceName]*quantity),
 	}
 
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" {
-		redisAddr = "redis:6379" // fallback
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "redis://default:vgwskzsr@optimizemonitor-redis.ns-hxdhwnk5.svc:6379"
 	}
-	r.RedisClient = redis.NewClient(&redis.Options{
-		Addr:     redisAddr,
-		Password: "",
-		DB:       0,
-	})
-	r.TrafficCache = &TrafficCache{Redis: r.RedisClient, TTL: 2 * time.Hour}
+	opt, err := redis.ParseURL(redisURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse redis url: %w", err)
+	}
+	r.RedisClient = redis.NewClient(opt)
 
-	// ② 初始化 GPU 缓存
+	// 初始化 GPU 缓存
 	if err := retry.Retry(2, time.Second, func() error {
 		var err error
 		r.NvidiaGpu, err = gpu.GetNodeGpuModel(mgr.GetClient())
@@ -991,6 +990,9 @@ func (r *MonitorReconciler) calculatePodResource(pod *corev1.Pod) map[corev1.Res
 	for _, c := range pod.Spec.Containers {
 		if gpuReq, ok := c.Resources.Limits[gpu.NvidiaGpuKey]; ok {
 			// gpu only use limit
+			if _, exists := c.Resources.Limits[gpu.NvidiaGpuKey]; exists {
+				usage[gpu.NvidiaGpuKey] = initGpuResources()
+			}
 			usage[gpu.NvidiaGpuKey].Add(gpuReq)
 		}
 		if skip {
