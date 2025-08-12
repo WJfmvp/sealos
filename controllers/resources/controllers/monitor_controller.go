@@ -167,7 +167,7 @@ func NewMonitorReconciler(mgr ctrl.Manager) (*MonitorReconciler, error) {
 
 	redisURL := os.Getenv("REDIS_URL")
 	if redisURL == "" {
-		redisURL = "redis://default:vgwskzsr@optimizemonitor-redis.ns-hxdhwnk5.svc:6379"
+		fmt.Errorf("failed to get REDIS_URL")
 	}
 	opt, err := redis.ParseURL(redisURL)
 	if err != nil {
